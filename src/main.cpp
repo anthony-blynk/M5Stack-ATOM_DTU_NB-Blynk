@@ -71,7 +71,7 @@ void log(String info) {
 
 void setup() {
     AtomS3.begin(true);
-    delay(10000);
+    // delay(10000);
     Serial.println(">>ATOM DTU NB MQTT TEST");
     SerialAT.begin(SIM7028_BAUDRATE, SERIAL_8N1, ATOM_DTU_SIM7028_RX,
                    ATOM_DTU_SIM7028_TX);
@@ -157,7 +157,7 @@ void nbConnect() {
   // once it registers to a base station tower.
   if (!modem.waitForNetwork(60000L)) { 
     SerialMon.println("Network registration failed.");
-    delay(10000);
+    delay(3000);
     return;
   }
   
