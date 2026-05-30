@@ -32,6 +32,15 @@
 #include <TinyGsmClient.h>
 #include <time.h>
 #include <sys/time.h>
+
+#include <ModbusMaster.h>
+
+ModbusMaster sensorNode;
+
+#define RS485_TX_PIN 7
+#define RS485_RX_PIN 8
+
+
 #define MQTT_BROKER   "lon1.blynk.cloud"  //thingscloud gz-3 is a zone, please change to your own corresponding zone
 #define MQTT_PORT     1883        //Port number
 
@@ -63,7 +72,9 @@ PubSubClient mqttClient(MQTT_BROKER, MQTT_PORT, tcpClient);
 void mqttCallback(char *topic, byte *payload, unsigned int len);
 bool mqttConnect(void);
 void nbConnect(void);
-
+void initModbus(void);
+void pollSensorAndPublish(void);
+bool setModbusRelayState(bool);
 
 void log(String info) {
     SerialMon.println(info);
@@ -79,6 +90,7 @@ void setup() {
     nbConnect();
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);                    // Set the server to which the client is connected.  server using port 1883
     mqttClient.setCallback(mqttCallback);
+    initModbus();
 }
 
 void loop() {
@@ -111,12 +123,14 @@ void loop() {
             num=0;
           }
 
-          log("public the data:"); 
-          log(param);
-          log("\n");
+        //   log("public the data:"); 
+        //   log(param);
+        //   log("\n");
        
-          mqttClient.publish(ONENET_TOPIC_POST, param);
-          //Send data to the topic
+        //   mqttClient.publish(ONENET_TOPIC_POST, param);
+
+          pollSensorAndPublish();
+
           delay(500);
           
         }
@@ -164,31 +178,95 @@ void nbConnect() {
   SerialMon.println("Network registered and ready!");
 }
 
-// void nbConnect(void) {
-//     unsigned long start = millis();
-//     log("Initializing modem...");
-//     while (!modem.init()) {
-//         log("waiting1...." + String((millis() - start) / 1000) + "s");
-//     };
+void initModbus() {
+    log("Initializing ESP32-S3 Native Hardware Serial...");
+    
+    // 1. Force the previous engine allocation states clear
+    Serial2.end();
+    delay(100);
+    
+    // 2. Initialize Serial 2 on the ESP32-S3 matrix.
+    // Notice the exact parameter routing order: Baud, Mode, RX_Pin, TX_Pin
+    Serial2.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+    
+    // 3. CRITICAL FOR ESP32-S3: Force the internal serial engine to release 
+    // the half-duplex line listening state machine automatically.
+    Serial2.setPins(RS485_RX_PIN, RS485_TX_PIN); 
+    
+    // 4. Bind the Modbus node object to our clean ESP32-S3 driver pipeline
+    sensorNode.begin(1, Serial2);
+    
+    log("ESP32-S3 Modbus Engine Stabilized on Pins G7/G8.");
+}
 
-//     start = millis();
-//     log("Waiting for network...");
-//     while (!modem.waitForNetwork()) {
-//         log("waiting2...." + String((millis() - start) / 1000) + "s");
-//     }
-//     log("success");
-//     SerialMon.println("Waiting for GPRS connect...");
-//     if (!modem.gprsConnectImpl("go.mono", "", "")) {
-//         SerialMon.println("waiting...." + String((millis() - start) / 1000) + "s");
-//     }
-//     SerialMon.println("success");
+static bool relayState = false; // Track the current state of the relay
 
+void pollSensorAndPublish() {
+    uint8_t result;
+    
+    // --- LAYOUT TEST A: Try starting at Address 0x0001 ---
+    log("Polling XY-MD02 (Attempting Register Offset 0x0001)...");
+    result = sensorNode.readInputRegisters(0x0001, 2);
+    
+    // If Offset 1 fails with an address exception, automatically drop back to Offset 2
+    if (result == 0x02) {
+        log("Address Exception 0x02 hit on offset 1. Attempting Register Offset 0x0002...");
+        result = sensorNode.readInputRegisters(0x0002, 2);
+    }
 
-//     // Example Query the IP address of a device
-//     String ip = modem.getLocalIP();
+    // --- EVALUATE THE FINAL RETURN FRAME ---
+    if (result == sensorNode.ku8MBSuccess) {
+        // Snatch the data pairs from the running index offsets safely
+        float temperature = (int16_t)sensorNode.getResponseBuffer(0x00) / 10.0;
+        float humidity    = (int16_t)sensorNode.getResponseBuffer(0x01) / 10.0;
+        
+        log("🎉 SUCCESS! Live Environmental Telemetry Captured:");
+        log("--> Temperature: " + String(temperature, 1) + "°C");
+        log("--> Humidity:    " + String(humidity, 1) + "%");
+        
+        // Feed the verified metrics into your stable Blynk pipeline
+        // if (isMqttConnected) {
+            char payload[120];
+            sprintf(payload, "{\"temp\":%.1f,\"hum\":%.1f}", temperature, humidity); 
+            // publishHardwareMQTT(ONENET_TOPIC_POST, payload);
+            mqttClient.publish(ONENET_TOPIC_POST, payload);
 
-//     log("Device IP address: " + ip);
+            relayState = !relayState; // Toggle the relay state for demonstration
+            setModbusRelayState(relayState);
+        // }
+    } else {
+        // Log standard debug flags (e.g., 0xE2 = Hardware line drop, 0x03 = Illegal Data Value)
+        log("Modbus Pipeline Error Frame: 0x" + String(result, HEX));
+    }
+}
 
-//     log("success");
-// }
+#define SENSOR_SLAVE_ID 1
+#define RELAY_SLAVE_ID  2
 
+#define RELAY_CONTROL_REG 1
+#define RELAY_VAL_ON      256  // 0x0100
+#define RELAY_VAL_OFF     512  // 0x0200
+
+// Helper function to set the relay state
+bool setModbusRelayState(bool turnOn) {
+    // 1. Temporarily re-bind the Modbus master instance to talk to Slave ID 2
+    sensorNode.begin(RELAY_SLAVE_ID, Serial2);
+    delay(10); 
+
+    uint16_t controlValue = turnOn ? RELAY_VAL_ON : RELAY_VAL_OFF;
+    log("Sending Relay " + String(turnOn ? "ON" : "OFF") + " command to Slave 2...");
+
+    // 2. Execute Function Code 06 (Write Single Register)
+    uint8_t result = sensorNode.writeSingleRegister(RELAY_CONTROL_REG, controlValue);
+
+    // 3. Immediately switch the binding token back to Slave ID 1 so the sensor polling doesn't break
+    sensorNode.begin(SENSOR_SLAVE_ID, Serial2);
+
+    if (result == sensorNode.ku8MBSuccess) {
+        log("🎉 Relay State Changed Successfully!");
+        return true;
+    } else {
+        log("Relay Command Failed! Modbus Error: 0x" + String(result, HEX));
+        return false;
+    }
+}
