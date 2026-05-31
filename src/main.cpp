@@ -20,12 +20,10 @@
 
 ModbusMaster sensorNode;
 
-#define RS485_TX_PIN 7
-#define RS485_RX_PIN 8
+#define BLYNK_TEMPLATE_ID  "TMPL4GQQAzx08"
+#define BLYNK_AUTH_TOKEN   "NrEsQx97BPbzVHXS1xi0TVcB2bhdOS42"
 
-#define BLYNK_TEMPLATE_ID "TMPL557JsEXCs"
-
-#define FIRMWARE_VERSION    "1.0.6"
+#define FIRMWARE_VERSION    "1.1.1"
 #define FIRMWARE_BUILD_DATE __DATE__ " " __TIME__
 
 // Blynk firmware identification tag — embedded in the binary so Blynk.Air
@@ -42,27 +40,29 @@ volatile const char firmwareTag[] = "blnkinf\0"
     BLYNK_PARAM_KV("blynk"  , BLYNK_RPC_LIB_VERSION)
     "\0";
 
-#define MQTT_BROKER   "lon1.blynk.cloud"
+#define MQTT_BROKER   "fra1.blynk.cloud"
 #define MQTT_PORT     1883
 
 #define UPLOAD_INTERVAL 1800000
 #define mqtt_devid    "device1"
 #define mqtt_pubid    "device"
-#define mqtt_password "exv5-ruwvPVvyfFPV6TXRKlknmtnwm1_"
+#define mqtt_password BLYNK_AUTH_TOKEN
 
 // Blynk MQTT topics — the broker routes by auth token internally;
 // device-side topics do NOT include the token prefix.
 // OTA payload from Blynk.Air: {"url":"http://...","size":354448}
-#define BLYNK_OTA_TOPIC  "downlink/ota/json"
-#define BLYNK_INFO_TOPIC "info/mcu"
+#define BLYNK_OTA_TOPIC   "downlink/ota/json"
+#define BLYNK_RELAY_TOPIC "downlink/ds/Relay"
+#define BLYNK_INFO_TOPIC  "info/mcu"
 
-#define ONENET_TOPIC_GET  "testtopic/10Download"
-#define ONENET_TOPIC_POST "testtopic/10Download"
+#define BLYNK_BATCH_TOPIC "batch_ds"
 
 uint32_t lastReconnectAttempt = 0;
+unsigned long pollTimer = 0;
 
 static bool otaPending = false;
 static char pendingOtaUrl[256] = {0};
+static bool relayState = false;
 
 #ifdef DUMP_AT_COMMANDS
 #include <StreamDebugger.h>
@@ -98,11 +98,10 @@ void setup() {
     mqttClient.setSocketTimeout(30); // 30 s socket timeout to handle cellular latency spikes
     mqttClient.setCallback(mqttCallback);
     initModbus();
+    pollTimer = millis() + 10000UL; // give XY-MD02 10 s to finish startup before first poll
 }
 
 void loop() {
-    static unsigned long timer = 0;
-
     if (otaPending) {
         otaPending = false;
         log(">>OTA: Initiating firmware update...");
@@ -123,8 +122,8 @@ void loop() {
         }
         delay(100);
     }
-    if (millis() >= timer) {
-        timer = millis() + UPLOAD_INTERVAL;
+    if (millis() >= pollTimer) {
+        pollTimer = millis() + UPLOAD_INTERVAL;
         if (mqttClient.connected()) {
             pollSensorAndPublish();
             delay(500);
@@ -141,6 +140,13 @@ void mqttCallback(char *topic, byte *payload, unsigned int len) {
 
     if (strcmp(topic, "downlink/ping") == 0) {
         log("PING received — PUBACK sent automatically");
+        return;
+    }
+
+    if (strcmp(topic, BLYNK_RELAY_TOPIC) == 0) {
+        bool on = (strcmp(info, "true") == 0 || strcmp(info, "1") == 0);
+        relayState = on;
+        setModbusRelayState(on);
         return;
     }
 
@@ -187,8 +193,8 @@ bool mqttConnect(void) {
         MQTT_MAX_PACKET_SIZE);
     mqttClient.publish(BLYNK_INFO_TOPIC, info);
 
-    mqttClient.subscribe(ONENET_TOPIC_GET);
     mqttClient.subscribe(BLYNK_OTA_TOPIC);
+    mqttClient.subscribe(BLYNK_RELAY_TOPIC);
     mqttClient.subscribe("downlink/ping", 1); // QoS 1 — broker expects PUBACK, sent automatically by PubSubClient
     return mqttClient.connected();
 }
@@ -207,13 +213,11 @@ void initModbus() {
     log("Initializing ESP32-S3 UART for Modbus...");
     Serial2.end();
     delay(100);
-    Serial2.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    Serial2.setPins(RS485_RX_PIN, RS485_TX_PIN);
+    Serial2.begin(9600, SERIAL_8N1, ATOM_DTU_RS485_RX, ATOM_DTU_RS485_TX);
+    Serial2.setPins(ATOM_DTU_RS485_RX, ATOM_DTU_RS485_TX);
     sensorNode.begin(1, Serial2);
     log("Modbus ready on G7/G8.");
 }
-
-static bool relayState = false;
 
 void pollSensorAndPublish() {
     uint8_t result;
@@ -229,11 +233,8 @@ void pollSensorAndPublish() {
         log("--> Temp: " + String(temperature, 1) + "C  Hum: " + String(humidity, 1) + "%");
 
         char payload[120];
-        sprintf(payload, "{\"temp\":%.1f,\"hum\":%.1f}", temperature, humidity);
-        mqttClient.publish(ONENET_TOPIC_POST, payload);
-
-        relayState = !relayState;
-        setModbusRelayState(relayState);
+        sprintf(payload, "{\"Temperature\":%.1f,\"Humidity\":%.1f}", temperature, humidity);
+        mqttClient.publish(BLYNK_BATCH_TOPIC, payload);
     } else {
         log("Modbus error: 0x" + String(result, HEX));
     }
