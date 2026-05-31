@@ -1,38 +1,21 @@
 /*
 *******************************************************************************
-* Copyright (c) 2025 by AtomS3Stack
-* SPDX-FileCopyrightText: 2025 AtomS3Stack Technology CO LTD
-*
-* SPDX-License-Identifier: MIT
-* Equipped with ATOM DTU NB MQTT sample source code
-* describe: ATOM DTU NB MQTT Clien Example.
-* Libraries:
-    - [TinyGSM - modify](https://github.com/m5stack/TinyGSM.git)   
-* lib_deps = 
-	  AtomS3stack/AtomS3Atom@^0.1.2
-	  fastled/FastLED@^3.9.14
-	  knolleary/PubSubClient@^2.8
-	  vshymanskyy/StreamDebugger@^1.0.1
-* date：2025/3/26
+* ATOM DTU NB — Modbus to MQTT to Blynk with OTA
 *******************************************************************************
 */
-// 1. Define the Serial port used for displaying debug outputs (usually Serial)
 #define SerialMon Serial
 #define TINY_GSM_DEBUG SerialMon
 
-// 2. Enable raw AT command dumping
 // #define DUMP_AT_COMMANDS
-
-// --- Make sure these are DEFINED BEFORE including the library ---
-// #include <TinyGsmClient.h>
 
 #include <M5AtomS3.h>
 #include "ATOM_DTU_NB.h"
 #include <PubSubClient.h>
 #include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
+#include <Update.h>
 #include <time.h>
 #include <sys/time.h>
-
 #include <ModbusMaster.h>
 
 ModbusMaster sensorNode;
@@ -40,25 +23,48 @@ ModbusMaster sensorNode;
 #define RS485_TX_PIN 7
 #define RS485_RX_PIN 8
 
+#define BLYNK_TEMPLATE_ID "TMPL557JsEXCs"
 
-#define MQTT_BROKER   "lon1.blynk.cloud"  //thingscloud gz-3 is a zone, please change to your own corresponding zone
-#define MQTT_PORT     1883        //Port number
+#define FIRMWARE_VERSION    "1.0.6"
+#define FIRMWARE_BUILD_DATE __DATE__ " " __TIME__
 
-#define UPLOAD_INTERVAL 10000
-#define mqtt_devid "device1" //Device Arbitrary name
-#define mqtt_pubid "device"        //username
-#define mqtt_password "exv5-ruwvPVvyfFPV6TXRKlknmtnwm1_" //password projectkey
+// Blynk firmware identification tag — embedded in the binary so Blynk.Air
+// can read the version, type, and build date without running the firmware.
+#define BLYNK_FIRMWARE_VERSION  FIRMWARE_VERSION
+#define BLYNK_FIRMWARE_TYPE     BLYNK_TEMPLATE_ID
+#define BLYNK_RPC_LIB_VERSION   "0.0.0"          // NCP lib version (N/A for raw MQTT)
 
+#define BLYNK_PARAM_KV(k, v)    k "\0" v "\0"
+volatile const char firmwareTag[] = "blnkinf\0"
+    BLYNK_PARAM_KV("mcu"    , BLYNK_FIRMWARE_VERSION)
+    BLYNK_PARAM_KV("fw-type", BLYNK_FIRMWARE_TYPE)
+    BLYNK_PARAM_KV("build"  , FIRMWARE_BUILD_DATE)
+    BLYNK_PARAM_KV("blynk"  , BLYNK_RPC_LIB_VERSION)
+    "\0";
 
-// Receive device properties to get the command topic
-#define ONENET_TOPIC_GET "testtopic/10Download" 
-// Send data subject on the device
-#define ONENET_TOPIC_POST  "testtopic/10Download"
-int num=0;
+#define MQTT_BROKER   "lon1.blynk.cloud"
+#define MQTT_PORT     1883
+
+#define UPLOAD_INTERVAL 1800000
+#define mqtt_devid    "device1"
+#define mqtt_pubid    "device"
+#define mqtt_password "exv5-ruwvPVvyfFPV6TXRKlknmtnwm1_"
+
+// Blynk MQTT topics — the broker routes by auth token internally;
+// device-side topics do NOT include the token prefix.
+// OTA payload from Blynk.Air: {"url":"http://...","size":354448}
+#define BLYNK_OTA_TOPIC  "downlink/ota/json"
+#define BLYNK_INFO_TOPIC "info/mcu"
+
+#define ONENET_TOPIC_GET  "testtopic/10Download"
+#define ONENET_TOPIC_POST "testtopic/10Download"
+
 uint32_t lastReconnectAttempt = 0;
 
-//#define DUMP_AT_COMMANDS    //If you need to debug, you can open this macro definition and TinyGsmClientSIM7028.h line 13 //#define TINY_GSM_DEBUG Serial
-#ifdef DUMP_AT_COMMANDS 
+static bool otaPending = false;
+static char pendingOtaUrl[256] = {0};
+
+#ifdef DUMP_AT_COMMANDS
 #include <StreamDebugger.h>
     StreamDebugger debugger(SerialAT, SerialMon);
     TinyGsm modem(debugger, ATOM_DTU_SIM7028_RESET);
@@ -67,7 +73,7 @@ uint32_t lastReconnectAttempt = 0;
 #endif
 
 TinyGsmClient tcpClient(modem);
-PubSubClient mqttClient(MQTT_BROKER, MQTT_PORT, tcpClient);
+PubSubClient  mqttClient(MQTT_BROKER, MQTT_PORT, tcpClient);
 
 void mqttCallback(char *topic, byte *payload, unsigned int len);
 bool mqttConnect(void);
@@ -75,20 +81,21 @@ void nbConnect(void);
 void initModbus(void);
 void pollSensorAndPublish(void);
 bool setModbusRelayState(bool);
+void performOtaUpdate(const char* url);
 
 void log(String info) {
     SerialMon.println(info);
 }
 
 void setup() {
-    AtomS3.begin(true);
-    // delay(10000);
-    Serial.println(">>ATOM DTU NB MQTT TEST");
+    AtomS3.begin(false);
+    Serial.println(">>ATOM DTU NB  FW:" FIRMWARE_VERSION "  Built:" FIRMWARE_BUILD_DATE);
     SerialAT.begin(SIM7028_BAUDRATE, SERIAL_8N1, ATOM_DTU_SIM7028_RX,
                    ATOM_DTU_SIM7028_TX);
-    AtomS3.dis.drawpix(0x0000ff);
     nbConnect();
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);                    // Set the server to which the client is connected.  server using port 1883
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setKeepAlive(300);    // 300 s — NB-IoT needs long keepalive
+    mqttClient.setSocketTimeout(30); // 30 s socket timeout to handle cellular latency spikes
     mqttClient.setCallback(mqttCallback);
     initModbus();
 }
@@ -96,11 +103,17 @@ void setup() {
 void loop() {
     static unsigned long timer = 0;
 
+    if (otaPending) {
+        otaPending = false;
+        log(">>OTA: Initiating firmware update...");
+        mqttClient.disconnect();
+        delay(4000);  // SIM7028 needs ~3-4s to fully release socket after close
+        performOtaUpdate(pendingOtaUrl);
+        // performOtaUpdate reboots on success; if we reach here the update failed.
+    }
+
     if (!mqttClient.connected()) {
-        log(">>MQTT NOT CONNECTED");
-        log(mqttClient.state());
-        // Reconnect every 10 seconds
-        AtomS3.dis.drawpix(0xff0000);
+        log(">>MQTT NOT CONNECTED rc=" + String(mqttClient.state()));
         uint32_t t = millis();
         if (t - lastReconnectAttempt > 3000L) {
             lastReconnectAttempt = t;
@@ -112,161 +125,251 @@ void loop() {
     }
     if (millis() >= timer) {
         timer = millis() + UPLOAD_INTERVAL;
-        if (mqttClient.connected())
-        {
-
-          /// First concatenate the json string
-          char param[120];
-          sprintf(param, "{\"num\":%d}",num); /// We write the data to be uploaded in the param
-          num+=1;
-          if(num>256){
-            num=0;
-          }
-
-        //   log("public the data:"); 
-        //   log(param);
-        //   log("\n");
-       
-        //   mqttClient.publish(ONENET_TOPIC_POST, param);
-
-          pollSensorAndPublish();
-
-          delay(500);
-          
+        if (mqttClient.connected()) {
+            pollSensorAndPublish();
+            delay(500);
         }
     }
-    AtomS3.dis.drawpix(0x00ff00);
     mqttClient.loop();
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int len) {
-    char info[len + 1];  // Add a location for the null termination character
+    char info[len + 1];
     memcpy(info, payload, len);
-    info[len] = '\0';  // Add the null terminator
-    log("Message arrived:"+String(info));
-    log("Topic received: " + String(topic));  // Print the received topic
-   
+    info[len] = '\0';
+    log("MQTT <<< [" + String(topic) + "] " + String(info));
+
+    if (strcmp(topic, "downlink/ping") == 0) {
+        log("PING received — PUBACK sent automatically");
+        return;
+    }
+
+    // OTA trigger — only act on the designated Blynk downlink topic.
+    if (strcmp(topic, BLYNK_OTA_TOPIC) == 0) {
+        const char* urlKey = "\"url\":\"";
+        char* urlStart = strstr(info, urlKey);
+        if (urlStart != nullptr) {
+            urlStart += strlen(urlKey);
+            char* urlEnd = strchr(urlStart, '"');
+            if (urlEnd != nullptr) {
+                *urlEnd = '\0';
+                if (strncmp(urlStart, "http://", 7) == 0) {
+                    strncpy(pendingOtaUrl, urlStart, sizeof(pendingOtaUrl) - 1);
+                    pendingOtaUrl[sizeof(pendingOtaUrl) - 1] = '\0';
+                    otaPending = true;
+                    log("OTA: URL queued: " + String(pendingOtaUrl));
+                } else {
+                    log("OTA: Only HTTP supported. Got: " + String(urlStart));
+                }
+            }
+        }
+    }
 }
 
 bool mqttConnect(void) {
-    log("Connecting to ");
-    log(MQTT_BROKER);
-  
-    bool status =mqttClient.connect(mqtt_devid, mqtt_pubid, mqtt_password); 
-    if (status == false) {
-        int errorCode = mqttClient.state();
-        log("MQTT Connection failed with error code: " + String(errorCode));
+    log("Connecting to " MQTT_BROKER "...");
+    bool status = mqttClient.connect(mqtt_devid, mqtt_pubid, mqtt_password);
+    if (!status) {
+        log("MQTT failed rc=" + String(mqttClient.state()));
         return false;
     }
-    log("MQTT CONNECTED!");
-   
+    log("MQTT CONNECTED  FW:" FIRMWARE_VERSION);
+
+    // Publish device info so Blynk.Air can track firmware version and
+    // determine whether an OTA push is needed.
+    char info[256];
+    snprintf(info, sizeof(info),
+        "{\"tmpl\":\"%s\",\"ver\":\"%s\",\"build\":\"%s\",\"type\":\"%s\",\"rxbuff\":%d}",
+        BLYNK_FIRMWARE_TYPE,
+        BLYNK_FIRMWARE_VERSION,
+        FIRMWARE_BUILD_DATE,
+        BLYNK_FIRMWARE_TYPE,
+        MQTT_MAX_PACKET_SIZE);
+    mqttClient.publish(BLYNK_INFO_TOPIC, info);
+
     mqttClient.subscribe(ONENET_TOPIC_GET);
+    mqttClient.subscribe(BLYNK_OTA_TOPIC);
+    mqttClient.subscribe("downlink/ping", 1); // QoS 1 — broker expects PUBACK, sent automatically by PubSubClient
     return mqttClient.connected();
 }
 
 void nbConnect() {
-  SerialMon.println("Waiting for network...");
-  
-  // The SIM7028 automatically connects to the APN behind the scenes 
-  // once it registers to a base station tower.
-  if (!modem.waitForNetwork(60000L)) { 
-    SerialMon.println("Network registration failed.");
-    delay(3000);
-    return;
-  }
-  
-  SerialMon.println("Network registered and ready!");
+    SerialMon.println("Waiting for NB-IoT network...");
+    if (!modem.waitForNetwork(60000L)) {
+        SerialMon.println("Network registration failed.");
+        delay(3000);
+        return;
+    }
+    SerialMon.println("NB-IoT network ready!");
 }
 
 void initModbus() {
-    log("Initializing ESP32-S3 Native Hardware Serial...");
-    
-    // 1. Force the previous engine allocation states clear
+    log("Initializing ESP32-S3 UART for Modbus...");
     Serial2.end();
     delay(100);
-    
-    // 2. Initialize Serial 2 on the ESP32-S3 matrix.
-    // Notice the exact parameter routing order: Baud, Mode, RX_Pin, TX_Pin
     Serial2.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    
-    // 3. CRITICAL FOR ESP32-S3: Force the internal serial engine to release 
-    // the half-duplex line listening state machine automatically.
-    Serial2.setPins(RS485_RX_PIN, RS485_TX_PIN); 
-    
-    // 4. Bind the Modbus node object to our clean ESP32-S3 driver pipeline
+    Serial2.setPins(RS485_RX_PIN, RS485_TX_PIN);
     sensorNode.begin(1, Serial2);
-    
-    log("ESP32-S3 Modbus Engine Stabilized on Pins G7/G8.");
+    log("Modbus ready on G7/G8.");
 }
 
-static bool relayState = false; // Track the current state of the relay
+static bool relayState = false;
 
 void pollSensorAndPublish() {
     uint8_t result;
-    
-    // --- LAYOUT TEST A: Try starting at Address 0x0001 ---
-    log("Polling XY-MD02 (Attempting Register Offset 0x0001)...");
+    log("Polling XY-MD02...");
     result = sensorNode.readInputRegisters(0x0001, 2);
-    
-    // If Offset 1 fails with an address exception, automatically drop back to Offset 2
     if (result == 0x02) {
-        log("Address Exception 0x02 hit on offset 1. Attempting Register Offset 0x0002...");
         result = sensorNode.readInputRegisters(0x0002, 2);
     }
 
-    // --- EVALUATE THE FINAL RETURN FRAME ---
     if (result == sensorNode.ku8MBSuccess) {
-        // Snatch the data pairs from the running index offsets safely
         float temperature = (int16_t)sensorNode.getResponseBuffer(0x00) / 10.0;
         float humidity    = (int16_t)sensorNode.getResponseBuffer(0x01) / 10.0;
-        
-        log("🎉 SUCCESS! Live Environmental Telemetry Captured:");
-        log("--> Temperature: " + String(temperature, 1) + "°C");
-        log("--> Humidity:    " + String(humidity, 1) + "%");
-        
-        // Feed the verified metrics into your stable Blynk pipeline
-        // if (isMqttConnected) {
-            char payload[120];
-            sprintf(payload, "{\"temp\":%.1f,\"hum\":%.1f}", temperature, humidity); 
-            // publishHardwareMQTT(ONENET_TOPIC_POST, payload);
-            mqttClient.publish(ONENET_TOPIC_POST, payload);
+        log("--> Temp: " + String(temperature, 1) + "C  Hum: " + String(humidity, 1) + "%");
 
-            relayState = !relayState; // Toggle the relay state for demonstration
-            setModbusRelayState(relayState);
-        // }
+        char payload[120];
+        sprintf(payload, "{\"temp\":%.1f,\"hum\":%.1f}", temperature, humidity);
+        mqttClient.publish(ONENET_TOPIC_POST, payload);
+
+        relayState = !relayState;
+        setModbusRelayState(relayState);
     } else {
-        // Log standard debug flags (e.g., 0xE2 = Hardware line drop, 0x03 = Illegal Data Value)
-        log("Modbus Pipeline Error Frame: 0x" + String(result, HEX));
+        log("Modbus error: 0x" + String(result, HEX));
     }
 }
 
-#define SENSOR_SLAVE_ID 1
-#define RELAY_SLAVE_ID  2
-
+#define SENSOR_SLAVE_ID   1
+#define RELAY_SLAVE_ID    2
 #define RELAY_CONTROL_REG 1
-#define RELAY_VAL_ON      256  // 0x0100
-#define RELAY_VAL_OFF     512  // 0x0200
+#define RELAY_VAL_ON      256   // 0x0100
+#define RELAY_VAL_OFF     512   // 0x0200
 
-// Helper function to set the relay state
 bool setModbusRelayState(bool turnOn) {
-    // 1. Temporarily re-bind the Modbus master instance to talk to Slave ID 2
     sensorNode.begin(RELAY_SLAVE_ID, Serial2);
-    delay(10); 
-
+    delay(10);
     uint16_t controlValue = turnOn ? RELAY_VAL_ON : RELAY_VAL_OFF;
-    log("Sending Relay " + String(turnOn ? "ON" : "OFF") + " command to Slave 2...");
-
-    // 2. Execute Function Code 06 (Write Single Register)
+    log("Relay " + String(turnOn ? "ON" : "OFF") + " -> Slave 2");
     uint8_t result = sensorNode.writeSingleRegister(RELAY_CONTROL_REG, controlValue);
-
-    // 3. Immediately switch the binding token back to Slave ID 1 so the sensor polling doesn't break
     sensorNode.begin(SENSOR_SLAVE_ID, Serial2);
-
     if (result == sensorNode.ku8MBSuccess) {
-        log("🎉 Relay State Changed Successfully!");
+        log("Relay OK");
         return true;
+    }
+    log("Relay error: 0x" + String(result, HEX));
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// OTA firmware update over cellular HTTP
+// ---------------------------------------------------------------------------
+void performOtaUpdate(const char* url) {
+    log("OTA: Downloading from " + String(url));
+
+    // Parse http://host[:port]/path
+    char host[128] = {0};
+    char path[256] = {0};
+    int  port = 80;
+
+    const char* p = url + 7;  // skip "http://"
+    const char* slash = strchr(p, '/');
+    if (slash != nullptr) {
+        size_t hostLen = (size_t)(slash - p);
+        strncpy(host, p, min(hostLen, sizeof(host) - 1));
+        strncpy(path, slash, sizeof(path) - 1);
     } else {
-        log("Relay Command Failed! Modbus Error: 0x" + String(result, HEX));
-        return false;
+        strncpy(host, p, sizeof(host) - 1);
+        path[0] = '/'; path[1] = '\0';
+    }
+
+    char* colon = strchr(host, ':');
+    if (colon != nullptr) {
+        port = atoi(colon + 1);
+        *colon = '\0';
+    }
+
+    log("OTA: Host=" + String(host) + " Port=" + String(port) + " Path=" + String(path));
+
+    // Explicitly stop and drain the socket before reuse. ArduinoHttpClient's
+    // connect() calls stop() internally, which re-sends AT+CIPCLOSE on an
+    // already-closed socket. The error response would corrupt the next
+    // AT+CIPRXGET=1 exchange, so we stop cleanly here first.
+    tcpClient.stop();
+    delay(1000);
+
+    HttpClient http(tcpClient, host, port);
+    http.setTimeout(30000);
+
+    int err = http.get(path);
+    if (err != 0) {
+        log("OTA: HTTP GET failed err=" + String(err));
+        return;
+    }
+
+    int statusCode = http.responseStatusCode();
+    log("OTA: HTTP " + String(statusCode));
+    if (statusCode != 200) {
+        log("OTA: Aborting on non-200 status");
+        http.stop();
+        return;
+    }
+
+    int contentLength = http.contentLength();
+    log("OTA: Content-Length=" + String(contentLength));
+
+    if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
+        log("OTA: Update.begin failed: " + String(Update.errorString()));
+        http.stop();
+        return;
+    }
+
+    uint8_t buf[512];
+    int totalWritten = 0;
+    int lastLogBand = -1;
+
+    while (http.connected() || http.available()) {
+        int avail = http.available();
+        if (avail > 0) {
+            int toRead = min(avail, (int)sizeof(buf));
+            if (contentLength > 0) {
+                toRead = min(toRead, contentLength - totalWritten);
+            }
+            int bytesRead = http.read(buf, toRead);
+            if (bytesRead > 0) {
+                size_t written = Update.write(buf, (size_t)bytesRead);
+                if (written != (size_t)bytesRead) {
+                    log("OTA: Flash write error: " + String(Update.errorString()));
+                    http.stop();
+                    Update.abort();
+                    return;
+                }
+                totalWritten += bytesRead;
+                if (contentLength > 0) {
+                    int band = (totalWritten * 10) / contentLength;
+                    if (band != lastLogBand) {
+                        lastLogBand = band;
+                        log("OTA: " + String(band * 10) + "% (" + String(totalWritten) + "/" + String(contentLength) + ")");
+                    }
+                    if (totalWritten >= contentLength) break;
+                }
+            }
+        } else {
+            delay(10);
+        }
+    }
+
+    http.stop();
+    log("OTA: Download complete — " + String(totalWritten) + " bytes");
+
+    if (Update.end()) {
+        if (Update.isFinished()) {
+            log("OTA: SUCCESS! Rebooting in 2s...");
+            delay(2000);
+            ESP.restart();
+        } else {
+            log("OTA: Incomplete — expected " + String(contentLength) + " wrote " + String(totalWritten));
+        }
+    } else {
+        log("OTA: Update.end failed: " + String(Update.errorString()));
     }
 }
