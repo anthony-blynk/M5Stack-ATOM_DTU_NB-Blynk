@@ -20,8 +20,8 @@
 
 ModbusMaster sensorNode;
 
-#define BLYNK_TEMPLATE_ID  "TMPL4GQQAzx08"
-#define BLYNK_AUTH_TOKEN   "NrEsQx97BPbzVHXS1xi0TVcB2bhdOS42"
+#define BLYNK_TEMPLATE_ID  "<your template>"
+#define BLYNK_AUTH_TOKEN   "<your token>"
 
 #define FIRMWARE_VERSION    "1.1.1"
 #define FIRMWARE_BUILD_DATE __DATE__ " " __TIME__
