@@ -59,6 +59,9 @@ volatile const char firmwareTag[] = "blnkinf\0"
 
 uint32_t lastReconnectAttempt = 0;
 unsigned long pollTimer = 0;
+static uint8_t connectFailCount = 0;
+static uint32_t reconnectCount = 0;
+static uint32_t modemResetCount = 0;
 
 static bool otaPending = false;
 static char pendingOtaUrl[256] = {0};
@@ -81,6 +84,7 @@ void nbConnect(void);
 void initModbus(void);
 void pollSensorAndPublish(void);
 bool setModbusRelayState(bool);
+void resetModem(void);
 void performOtaUpdate(const char* url);
 
 void log(String info) {
@@ -90,9 +94,12 @@ void log(String info) {
 void setup() {
     AtomS3.begin(false);
     Serial.println(">>ATOM DTU NB  FW:" FIRMWARE_VERSION "  Built:" FIRMWARE_BUILD_DATE);
+    pinMode(ATOM_DTU_SIM7028_EN, OUTPUT);
+    digitalWrite(ATOM_DTU_SIM7028_EN, HIGH);
     SerialAT.begin(SIM7028_BAUDRATE, SERIAL_8N1, ATOM_DTU_SIM7028_RX,
                    ATOM_DTU_SIM7028_TX);
     nbConnect();
+    log("SIM7028: " + modem.getModemInfo());
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setKeepAlive(300);    // 300 s — NB-IoT needs long keepalive
     mqttClient.setSocketTimeout(30); // 30 s socket timeout to handle cellular latency spikes
@@ -117,7 +124,12 @@ void loop() {
         if (t - lastReconnectAttempt > 3000L) {
             lastReconnectAttempt = t;
             if (mqttConnect()) {
+                reconnectCount++;
+                connectFailCount = 0;
                 lastReconnectAttempt = 0;
+            } else if (++connectFailCount >= 3) {
+                connectFailCount = 0;
+                resetModem();
             }
         }
         delay(100);
@@ -173,6 +185,14 @@ void mqttCallback(char *topic, byte *payload, unsigned int len) {
 }
 
 bool mqttConnect(void) {
+    if (!modem.isNetworkConnected()) {
+        log("NB-IoT lost — reconnecting...");
+        if (!modem.waitForNetwork(60000L)) {
+            log("NB-IoT reconnect failed");
+            return false;
+        }
+        log("NB-IoT network ready!");
+    }
     log("Connecting to " MQTT_BROKER "...");
     bool status = mqttClient.connect(mqtt_devid, mqtt_pubid, mqtt_password);
     if (!status) {
@@ -232,8 +252,9 @@ void pollSensorAndPublish() {
         float humidity    = (int16_t)sensorNode.getResponseBuffer(0x01) / 10.0;
         log("--> Temp: " + String(temperature, 1) + "C  Hum: " + String(humidity, 1) + "%");
 
-        char payload[120];
-        sprintf(payload, "{\"Temperature\":%.1f,\"Humidity\":%.1f}", temperature, humidity);
+        char payload[200];
+        sprintf(payload, "{\"Temperature\":%.1f,\"Humidity\":%.1f,\"Reconnects\":%lu,\"ModemResets\":%lu}",
+                temperature, humidity, reconnectCount, modemResetCount);
         mqttClient.publish(BLYNK_BATCH_TOPIC, payload);
     } else {
         log("Modbus error: 0x" + String(result, HEX));
@@ -259,6 +280,20 @@ bool setModbusRelayState(bool turnOn) {
     }
     log("Relay error: 0x" + String(result, HEX));
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Modem hard reset — pulse RESET_N low, then re-register on NB-IoT
+// ---------------------------------------------------------------------------
+void resetModem() {
+    modemResetCount++;
+    log("Modem power cycle #" + String(modemResetCount) + "...");
+    digitalWrite(ATOM_DTU_SIM7028_EN, LOW);  // cut power to SIM7028
+    delay(1000);
+    digitalWrite(ATOM_DTU_SIM7028_EN, HIGH); // restore power
+    delay(5000); // SIM7028 needs ~3-5 s to boot
+    SerialAT.begin(SIM7028_BAUDRATE, SERIAL_8N1, ATOM_DTU_SIM7028_RX, ATOM_DTU_SIM7028_TX);
+    nbConnect();
 }
 
 // ---------------------------------------------------------------------------
